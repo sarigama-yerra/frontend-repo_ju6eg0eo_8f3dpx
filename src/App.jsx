@@ -1,5 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+
+// Utility: next lower power of two <= n
+function floorPowerOfTwo(n) {
+  if (n < 1) return 1
+  let p = 1
+  while ((p << 1) <= n) p <<= 1
+  return p
+}
 
 // Utility: next power of two >= n
 function nextPowerOfTwo(n) {
@@ -19,60 +27,118 @@ function shuffle(array) {
   return arr
 }
 
-// Creates initial rounds structure from a seeded list of names
-function createInitialRounds(seeds) {
-  const size = nextPowerOfTwo(seeds.length)
-  const totalRounds = Math.log2(size)
-  // Pad with nulls (byes)
-  const padded = [...seeds]
-  while (padded.length < size) padded.push(null)
+// Build bracket with an automatic preliminary round (if needed)
+// Data model: each match may specify sources for p1/p2: { r: roundIndex, m: matchIndex }
+function createRoundsWithPrelim(seeds) {
+  const n = seeds.length
+  if (n < 2) return []
 
-  // Build first round matches
-  const round0 = []
-  for (let i = 0; i < size; i += 2) {
-    round0.push({
-      p1: padded[i],
-      p2: padded[i + 1],
-      winner: padded[i] && !padded[i + 1] ? padded[i] : padded[i + 1] && !padded[i] ? padded[i + 1] : null,
+  const base = floorPowerOfTwo(n) // main bracket size
+  const prelimMatches = n - base // number of preliminary matches required
+
+  // If already power of two, build simple bracket without prelim/byes
+  if (prelimMatches <= 0) {
+    // Build first round from seeds directly
+    const round0 = []
+    for (let i = 0; i < n; i += 2) {
+      round0.push({ p1: seeds[i] || null, p2: seeds[i + 1] || null, winner: null, score1: '', score2: '', id: `r0-m${i / 2}` })
+    }
+    // If odd n (shouldn't happen since base==n and n>=2 implies even), still handled by null
+    const rounds = [round0]
+    let size = round0.length
+    let r = 1
+    while (size > 1) {
+      const matches = []
+      for (let m = 0; m < size / 2; m++) {
+        matches.push({ p1: null, p2: null, winner: null, score1: '', score2: '', id: `r${r}-m${m}`, source1: { r: r - 1, m: m * 2 }, source2: { r: r - 1, m: m * 2 + 1 } })
+      }
+      rounds.push(matches)
+      size = matches.length
+      r++
+    }
+    return propagateWinners(rounds)
+  }
+
+  // With prelim:
+  // - first 2*prelimMatches participants play in prelim
+  // - remaining get a bye into main bracket (base participants total)
+  const prelimPlayersCount = prelimMatches * 2
+  const prelimPlayers = seeds.slice(0, prelimPlayersCount)
+  const byePlayers = seeds.slice(prelimPlayersCount)
+
+  // Preliminary round
+  const prelimRound = []
+  for (let i = 0; i < prelimPlayers.length; i += 2) {
+    prelimRound.push({ p1: prelimPlayers[i] || null, p2: prelimPlayers[i + 1] || null, winner: null, score1: '', score2: '', id: `r0-m${i / 2}` })
+  }
+
+  // Build main bracket entrants (base participants):
+  // Fill first with winners from prelim (as sources), then with bye players (as fixed names)
+  const entrants = []
+  for (let i = 0; i < prelimRound.length; i++) {
+    entrants.push({ source: { r: 0, m: i } })
+  }
+  for (const name of byePlayers) entrants.push({ name })
+  // Now entrants.length === base
+
+  // First main round (index 1)
+  const round1 = []
+  for (let i = 0; i < base; i += 2) {
+    const a = entrants[i]
+    const b = entrants[i + 1]
+    round1.push({
+      p1: a?.name || null,
+      p2: b?.name || null,
+      winner: null,
       score1: '',
       score2: '',
-      id: `r0-m${i / 2}`,
+      id: `r1-m${i / 2}`,
+      source1: a?.source ? { r: 0, m: a.source.m } : undefined,
+      source2: b?.source ? { r: 0, m: b.source.m } : undefined,
     })
   }
 
-  // Initialize empty rounds for the rest
-  const rounds = [round0]
-  for (let r = 1; r < totalRounds; r++) {
-    const prevLen = rounds[r - 1].length
+  // Subsequent rounds
+  const rounds = [prelimRound, round1]
+  let size = round1.length
+  let r = 2
+  while (size > 1) {
     const matches = []
-    for (let m = 0; m < prevLen / 2; m++) {
-      matches.push({ p1: null, p2: null, winner: null, score1: '', score2: '', id: `r${r}-m${m}` })
+    for (let m = 0; m < size / 2; m++) {
+      matches.push({ p1: null, p2: null, winner: null, score1: '', score2: '', id: `r${r}-m${m}`, source1: { r: r - 1, m: m * 2 }, source2: { r: r - 1, m: m * 2 + 1 } })
     }
     rounds.push(matches)
+    size = matches.length
+    r++
   }
 
-  // Propagate automatic byes forward once to seed known winners
   return propagateWinners(rounds)
 }
 
-// Rebuild downstream rounds based on winners of current and previous
+// Propagate using explicit sources
 function propagateWinners(rounds) {
   const newRounds = rounds.map(r => r.map(m => ({ ...m })))
-  for (let r = 0; r < newRounds.length - 1; r++) {
+
+  for (let r = 0; r < newRounds.length; r++) {
     const current = newRounds[r]
-    const next = newRounds[r + 1]
-    for (let i = 0; i < current.length; i += 2) {
-      const m1 = current[i]
-      const m2 = current[i + 1]
-      const target = next[Math.floor(i / 2)]
-      target.p1 = m1.winner || (m1.p1 && !m1.p2 ? m1.p1 : null)
-      target.p2 = m2.winner || (m2.p1 && !m2.p2 ? m2.p1 : null)
-      // Auto-advance if one side is a bye
-      if (target.p1 && !target.p2) target.winner = target.p1
-      else if (target.p2 && !target.p1) target.winner = target.p2
-      else target.winner = target.winner && (target.winner === target.p1 || target.winner === target.p2) ? target.winner : null
+    for (let i = 0; i < current.length; i++) {
+      const match = current[i]
+      // Resolve p1 from source if exists
+      if (match.source1) {
+        const src = newRounds[match.source1.r][match.source1.m]
+        match.p1 = src.winner || null
+      }
+      if (match.source2) {
+        const src = newRounds[match.source2.r][match.source2.m]
+        match.p2 = src.winner || null
+      }
+      // Auto-advance if one side present and the other absent
+      if (match.p1 && !match.p2) match.winner = match.p1
+      else if (match.p2 && !match.p1) match.winner = match.p2
+      else if (match.winner && match.winner !== match.p1 && match.winner !== match.p2) match.winner = null
     }
   }
+
   return newRounds
 }
 
@@ -97,6 +163,12 @@ export default function App() {
     })
   }, [num])
 
+  const buildBracket = (filledNames) => {
+    const randomized = shuffle(filledNames)
+    setSeeds(randomized)
+    setRounds(createRoundsWithPrelim(randomized))
+  }
+
   // Start seeding with a spin effect
   const startSeeding = () => {
     const filled = names.map(n => n.trim()).filter(Boolean)
@@ -106,11 +178,8 @@ export default function App() {
     }
     setShowWheel(true)
     setSpinning(true)
-    // Simulate spinning for 2.5s then set seeds and create bracket
     setTimeout(() => {
-      const randomized = shuffle(filled)
-      setSeeds(randomized)
-      setRounds(createInitialRounds(randomized))
+      buildBracket(filled)
       setSpinning(false)
       setTimeout(() => setShowWheel(false), 600)
     }, 2500)
@@ -122,9 +191,6 @@ export default function App() {
       const copy = prev.map(r => r.map(m => ({ ...m })))
       const match = copy[roundIndex][matchIndex]
       match.winner = winner
-      // Optional: reset scores if desired
-      if (winner === match.p1) match.score2 = ''
-      if (winner === match.p2) match.score1 = ''
       return propagateWinners(copy)
     })
   }
@@ -166,7 +232,7 @@ export default function App() {
                 onChange={e => setNum(Math.max(2, parseInt(e.target.value || '2')))}
                 className="w-full px-3 py-2 rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
-              <p className="text-xs text-slate-500 mt-1">Any number supported. Byes will be added automatically if needed.</p>
+              <p className="text-xs text-slate-500 mt-1">Any number supported. A preliminary round is created if needed.</p>
             </div>
 
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2 max-h-56 overflow-auto pr-1">
@@ -184,7 +250,7 @@ export default function App() {
 
           <div className="mt-4 flex flex-wrap gap-3">
             <button onClick={startSeeding} className="px-4 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Spin to Seed</button>
-            <button onClick={() => { const randomized = shuffle(names.filter(Boolean)); setSeeds(randomized); setRounds(createInitialRounds(randomized)); }} className="px-4 py-2 rounded-md bg-slate-800 text-white hover:bg-slate-900">Quick Randomize</button>
+            <button onClick={() => { const filled = names.map(n => n.trim()).filter(Boolean); if (filled.length<2){alert('Enter at least 2 names'); return;} buildBracket(filled); }} className="px-4 py-2 rounded-md bg-slate-800 text-white hover:bg-slate-900">Quick Randomize</button>
           </div>
         </div>
       </section>
@@ -253,15 +319,21 @@ function Bracket({ rounds, onPick }) {
     const total = rounds.length
     if (total === 0) return []
     const labels = []
+    // Detect if first round is a preliminary: occurs when round 0 feeds into round 1 with arbitrary mapping (we always do when rounds.length>1)
+    const hasPrelim = total > 1 && rounds[0].length !== rounds[1].length * 2
     for (let i = 0; i < total; i++) {
-      const remaining = total - i
-      if (remaining === 1) labels.push('Final')
-      else if (remaining === 2) labels.push('Semi-finals')
-      else if (remaining === 3) labels.push('Quarter-finals')
-      else labels.push(`Round ${i + 1}`)
+      if (hasPrelim && i === 0) {
+        labels.push('Preliminary')
+        continue
+      }
+      const remainingFromHere = total - i - (hasPrelim ? 1 : 0)
+      if (remainingFromHere === 1) labels.push('Final')
+      else if (remainingFromHere === 2) labels.push('Semi-finals')
+      else if (remainingFromHere === 3) labels.push('Quarter-finals')
+      else labels.push(`Round ${hasPrelim ? i : i + 1}`)
     }
     return labels
-  }, [rounds.length])
+  }, [rounds])
 
   return (
     <div className="p-4 md:p-6">
@@ -288,13 +360,13 @@ function MatchCard({ match, onPick }) {
     <div className="bg-white rounded-lg border border-slate-200 shadow-sm px-3 py-2">
       <div className="space-y-1">
         <ParticipantRow
-          name={match.p1 || '— bye —'}
+          name={match.p1 || '— waiting —'}
           active={match.winner === match.p1}
           disabled={!selectable1}
           onClick={() => selectable1 && onPick(match.p1)}
         />
         <ParticipantRow
-          name={match.p2 || '— bye —'}
+          name={match.p2 || '— waiting —'}
           active={match.winner === match.p2}
           disabled={!selectable2}
           onClick={() => selectable2 && onPick(match.p2)}
@@ -312,7 +384,7 @@ function ParticipantRow({ name, active, onClick, disabled }) {
       className={`w-full text-left px-2 py-2 rounded-md transition ${
         active ? 'bg-indigo-600 text-white' : disabled ? 'bg-slate-100 text-slate-400' : 'hover:bg-indigo-50'
       }`}
-      title={disabled ? 'Auto-advanced due to bye' : 'Click to set winner'}
+      title={disabled ? 'Waiting for previous match' : 'Click to set winner'}
     >
       <span className="truncate block">{name}</span>
     </button>
